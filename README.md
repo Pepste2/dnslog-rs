@@ -64,6 +64,7 @@ ns2       A      xxx.xxx.xxx.xxx
 dns       NS     ns1.xxx.com
 dns       NS     ns2.xxx.com
 ```
+<img width="1263" height="366" alt="image" src="https://github.com/user-attachments/assets/42db69d8-bc3a-4ff1-9d52-525af0ad3840" />
 
 3. **查看接收到的 DNS 请求结果：**
 
