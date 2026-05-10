@@ -37,41 +37,23 @@ struct CliArgs {
     #[arg(long)]
     web_port: Option<u16>,
 
-    /// HTTPS 端口
-    #[arg(long)]
-    https_port: Option<u16>,
-
     /// 域名后缀
     #[arg(long)]
     domain: Option<String>,
-
-    /// TLS 证书文件路径 (PEM)
-    #[arg(long)]
-    tls_cert: Option<String>,
-
-    /// TLS 私钥文件路径 (PEM)
-    #[arg(long)]
-    tls_key: Option<String>,
 }
 
 #[derive(Deserialize, Default, Clone)]
 struct FileConfig {
     dns_port: Option<u16>,
     web_port: Option<u16>,
-    https_port: Option<u16>,
     domain: Option<String>,
-    tls_cert: Option<String>,
-    tls_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 struct AppConfig {
     dns_port: u16,
     web_port: u16,
-    https_port: Option<u16>,
     domain: String,
-    tls_cert: Option<String>,
-    tls_key: Option<String>,
 }
 
 impl AppConfig {
@@ -99,24 +81,12 @@ impl AppConfig {
             .or_else(|| env::var("WEB_PORT").ok().and_then(|v| v.parse().ok()))
             .unwrap_or(8888);
 
-        let https_port = cli.https_port
-            .or(file_cfg.https_port)
-            .or_else(|| env::var("HTTPS_PORT").ok().and_then(|v| v.parse().ok()));
-
         let domain = cli.domain
             .or(file_cfg.domain)
             .or_else(|| env::var("DOMAIN_SUFFIX").ok())
             .unwrap_or_else(|| "example.com".to_string());
 
-        let tls_cert = cli.tls_cert
-            .or(file_cfg.tls_cert)
-            .or_else(|| env::var("TLS_CERT").ok());
-
-        let tls_key = cli.tls_key
-            .or(file_cfg.tls_key)
-            .or_else(|| env::var("TLS_KEY").ok());
-
-        Self { dns_port, web_port, https_port, domain, tls_cert, tls_key }
+        Self { dns_port, web_port, domain }
     }
 }
 
@@ -870,23 +840,6 @@ setInterval(function() {{ fetchLogs(); fetchSubdomains(); }}, 3000);
     HttpResponse::Ok().content_type("text/html; charset=utf-8").body(html)
 }
 
-// ---- HTTP -> HTTPS redirect handler ----
-
-async fn redirect_to_https(req: HttpRequest) -> impl Responder {
-    let host = req.connection_info().host().to_string();
-    // Strip port from host
-    let host_only = host.split(':').next().unwrap_or(&host);
-    let cfg = CONFIG.get().unwrap();
-    let https_port = cfg.https_port.unwrap_or(443);
-    let path = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-    let redirect_url = if https_port == 443 {
-        format!("https://{}{}", host_only, path)
-    } else {
-        format!("https://{}:{}{}", host_only, https_port, path)
-    };
-    HttpResponse::MovedPermanently().append_header(("Location", redirect_url)).finish()
-}
-
 // ---- Main ----
 
 #[tokio::main]
@@ -895,9 +848,7 @@ async fn main() -> std::io::Result<()> {
     println!("===== DNSLog 平台配置 =====");
     println!("域名后缀: {}", config.domain);
     println!("DNS 端口: {}", config.dns_port);
-    println!("HTTP 端口: {}", config.web_port);
-    if let Some(p) = config.https_port { println!("HTTPS 端口: {}", p); }
-    if config.tls_cert.is_some() { println!("TLS 证书: 已配置"); }
+    println!("Web 端口: {}", config.web_port);
     println!("===========================");
 
     let _ = CONFIG.set(config.clone());
@@ -940,89 +891,22 @@ async fn main() -> std::io::Result<()> {
         server.block_until_done().await.expect("DNS server error");
     });
 
-    // Web server (HTTP)
+    // Web server
     let pool_web = pool.clone();
-    let has_tls = config.tls_cert.is_some() && config.tls_key.is_some();
-
     let web_server = HttpServer::new(move || {
-        let app = App::new()
+        App::new()
             .app_data(web::Data::new(pool_web.clone()))
+            .route("/", web::get().to(dashboard))
             .route("/api/subdomains", web::get().to(subdomains_api))
             .route("/api/newsub", web::post().to(newsub_api))
             .route("/api/subdomain", web::delete().to(delete_sub_api))
             .route("/api/logs", web::get().to(get_logs_json))
             .route("/api/clear", web::post().to(clear_logs_api))
-            .route("/api/callback/{subdomain}", web::get().to(callback_api));
-
-        if has_tls {
-            // HTTP serves redirect only
-            app.route("/", web::get().to(redirect_to_https))
-        } else {
-            // HTTP serves dashboard
-            app.route("/", web::get().to(dashboard))
-        }
+            .route("/api/callback/{subdomain}", web::get().to(callback_api))
     })
     .bind(format!("0.0.0.0:{}", config.web_port))?;
 
-    // HTTPS server (if TLS configured)
-    let https_server = if let (Some(cert_path), Some(key_path)) = (&config.tls_cert, &config.tls_key) {
-        let cert_file = &mut std::io::BufReader::new(fs::File::open(cert_path).unwrap_or_else(|e| {
-            eprintln!("读取证书文件失败: {} - {}", cert_path, e);
-            std::process::exit(1);
-        }));
-        let key_file = &mut std::io::BufReader::new(fs::File::open(key_path).unwrap_or_else(|e| {
-            eprintln!("读取私钥文件失败: {} - {}", key_path, e);
-            std::process::exit(1);
-        }));
-
-        let certs: Vec<rustls::Certificate> = rustls_pemfile::certs(cert_file)
-            .unwrap_or_else(|e| { eprintln!("解析证书失败: {}", e); std::process::exit(1); })
-            .into_iter()
-            .map(rustls::Certificate)
-            .collect();
-
-        let key = rustls_pemfile::pkcs8_private_keys(key_file)
-            .or_else(|_| {
-                // Retry with RSA format
-                let key_file2 = &mut std::io::BufReader::new(fs::File::open(key_path).unwrap());
-                rustls_pemfile::rsa_private_keys(key_file2)
-            })
-            .unwrap_or_else(|e| { eprintln!("解析私钥失败: {}", e); std::process::exit(1); })
-            .into_iter()
-            .map(rustls::PrivateKey)
-            .next()
-            .unwrap_or_else(|| { eprintln!("未找到有效的私钥"); std::process::exit(1); });
-
-        let mut tls_config = rustls::ServerConfig::builder()
-            .with_safe_defaults()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .unwrap_or_else(|e| { eprintln!("TLS 配置失败: {}", e); std::process::exit(1); });
-
-        tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-
-        let pool_https = pool.clone();
-        let https_port = config.https_port.unwrap_or(443);
-        let server = HttpServer::new(move || {
-            App::new()
-                .app_data(web::Data::new(pool_https.clone()))
-                .route("/", web::get().to(dashboard))
-                .route("/api/subdomains", web::get().to(subdomains_api))
-                .route("/api/newsub", web::post().to(newsub_api))
-                .route("/api/subdomain", web::delete().to(delete_sub_api))
-                .route("/api/logs", web::get().to(get_logs_json))
-                .route("/api/clear", web::post().to(clear_logs_api))
-                .route("/api/callback/{subdomain}", web::get().to(callback_api))
-        })
-        .bind_rustls(format!("0.0.0.0:{}", https_port), tls_config)?;
-
-        println!("HTTPS 服务器监听: 0.0.0.0:{}", https_port);
-        Some(server.run())
-    } else {
-        None
-    };
-
-    println!("HTTP 服务器监听: 0.0.0.0:{}", config.web_port);
+    println!("Web 服务器监听: 0.0.0.0:{}", config.web_port);
     println!("域名后缀: {}", domain_suffix());
 
     tokio::select! {
@@ -1030,9 +914,6 @@ async fn main() -> std::io::Result<()> {
         res = web_server.run() => { res?; },
     }
 
-    if let Some(srv) = https_server {
-        srv.await?;
-    }
     dns_server.abort();
     Ok(())
 }
