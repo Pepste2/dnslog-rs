@@ -9,3 +9,7 @@ dns_port = 53
 
 # Web 端口（环境变量: WEB_PORT）
 web_port = 8888
+
+# DNS 查询回复地址（匹配的子域名返回此 IP，环境变量: DNS_RESPONSE）
+# 设置为一个有意义的 IP，例如你的服务器 IP 或 C2 地址
+dns_response = "127.0.0.1"

@@ -13,8 +13,9 @@ use std::fs;
 use std::sync::OnceLock;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
-use trust_dns_proto::op::ResponseCode;
-use trust_dns_proto::rr::RecordType;
+use std::net::Ipv4Addr;
+use trust_dns_proto::op::{Header, ResponseCode};
+use trust_dns_proto::rr::{Record, RecordType, RData};
 use trust_dns_server::authority::MessageResponseBuilder;
 use trust_dns_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo, ServerFuture};
 
@@ -40,6 +41,10 @@ struct CliArgs {
     /// 域名后缀
     #[arg(long)]
     domain: Option<String>,
+
+    /// DNS 回复地址
+    #[arg(long)]
+    dns_response: Option<String>,
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -47,6 +52,7 @@ struct FileConfig {
     dns_port: Option<u16>,
     web_port: Option<u16>,
     domain: Option<String>,
+    dns_response: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +60,7 @@ struct AppConfig {
     dns_port: u16,
     web_port: u16,
     domain: String,
+    dns_response: String,
 }
 
 impl AppConfig {
@@ -86,7 +93,12 @@ impl AppConfig {
             .or_else(|| env::var("DOMAIN_SUFFIX").ok())
             .unwrap_or_else(|| "example.com".to_string());
 
-        Self { dns_port, web_port, domain }
+        let dns_response = cli.dns_response
+            .or(file_cfg.dns_response)
+            .or_else(|| env::var("DNS_RESPONSE").ok())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+
+        Self { dns_port, web_port, domain, dns_response }
     }
 }
 
@@ -252,6 +264,7 @@ impl IpLookupService {
 struct MyDnsHandler {
     pool: Pool<SqliteConnectionManager>,
     ip_tx: mpsc::Sender<String>,
+    response_ip: Ipv4Addr,
 }
 
 fn record_type_string(rt: RecordType) -> &'static str {
@@ -277,8 +290,9 @@ impl RequestHandler for MyDnsHandler {
         let pool = self.pool.clone();
         let ip_tx = self.ip_tx.clone();
         let ip_for_lookup = client_ip.clone();
+        let resp_ip = self.response_ip;
 
-        tokio::task::spawn_blocking(move || {
+        let matched = tokio::task::spawn_blocking(move || {
             let conn = pool.get().expect("Failed to get DB connection");
             let result: Option<(String, String)> = conn
                 .query_row(
@@ -289,20 +303,42 @@ impl RequestHandler for MyDnsHandler {
                 .optional()
                 .expect("DB query failed");
             if let Some((_token, registered_sub)) = result {
-                println!("DNS [{}] {} -> {} 来源 {}", rt, normalized_query, registered_sub, client_ip);
+                println!("DNS [{}] {} -> {} 来源 {} 回复 {}", rt, normalized_query, registered_sub, client_ip, resp_ip);
                 let _ = conn.execute(
                     "INSERT INTO logs (registered_subdomain, requested_domain, client_ip, timestamp, record_type) VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![registered_sub, normalized_query, client_ip, timestamp, rt],
                 );
                 let _ = ip_tx.try_send(ip_for_lookup);
+                true
             } else {
                 println!("DNS [{}] {} (未注册) 来源 {}", rt, normalized_query, client_ip);
+                false
             }
         }).await.expect("spawn_blocking failed");
 
-        let response = MessageResponseBuilder::from_message_request(request)
-            .error_msg(request.header(), ResponseCode::NXDomain);
-        response_handle.send_response(response).await.expect("failed to send response")
+        let info = if matched && (query.query_type() == RecordType::A || query.query_type() == RecordType::ANY) {
+            // Return a fake A record with configured IP
+            let mut header = Header::new();
+            header.set_response_code(ResponseCode::NoError);
+            header.set_authoritative(true);
+            header.set_recursion_available(true);
+            let name = query.name().clone().into();
+            let mut record = Record::new();
+            record.set_name(name);
+            record.set_record_type(RecordType::A);
+            record.set_ttl(0);
+            record.set_data(Some(RData::A(resp_ip)));
+            let answers = vec![record];
+            let response = MessageResponseBuilder::from_message_request(request)
+                .build(header, answers.iter(), vec![], vec![], vec![]);
+            response_handle.send_response(response).await.expect("failed to send response")
+        } else {
+            // NXDOMAIN for unmatched or non-A queries
+            let response = MessageResponseBuilder::from_message_request(request)
+                .error_msg(request.header(), ResponseCode::NXDomain);
+            response_handle.send_response(response).await.expect("failed to send response")
+        };
+        info
     }
 }
 
@@ -849,6 +885,7 @@ async fn main() -> std::io::Result<()> {
     println!("域名后缀: {}", config.domain);
     println!("DNS 端口: {}", config.dns_port);
     println!("Web 端口: {}", config.web_port);
+    println!("DNS 回复: {}", config.dns_response);
     println!("===========================");
 
     let _ = CONFIG.set(config.clone());
@@ -884,9 +921,13 @@ async fn main() -> std::io::Result<()> {
     // DNS server
     let pool_dns = pool.clone();
     let dns_bind = format!("0.0.0.0:{}", config.dns_port);
+    let resp_ip: Ipv4Addr = config.dns_response.parse().unwrap_or_else(|_| {
+        eprintln!("无效的 DNS 回复地址: {}", config.dns_response);
+        std::process::exit(1);
+    });
     let dns_server = tokio::spawn(async move {
         let socket = UdpSocket::bind(&dns_bind).await.expect("绑定 DNS 端口失败");
-        let mut server = ServerFuture::new(MyDnsHandler { pool: pool_dns, ip_tx });
+        let mut server = ServerFuture::new(MyDnsHandler { pool: pool_dns, ip_tx, response_ip: resp_ip });
         server.register_socket(socket);
         server.block_until_done().await.expect("DNS server error");
     });
