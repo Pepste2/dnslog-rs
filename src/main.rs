@@ -291,6 +291,7 @@ impl RequestHandler for MyDnsHandler {
         let ip_tx = self.ip_tx.clone();
         let ip_for_lookup = client_ip.clone();
         let resp_ip = self.response_ip;
+        let query_type = query.query_type();
 
         let matched = tokio::task::spawn_blocking(move || {
             let conn = pool.get().expect("Failed to get DB connection");
@@ -303,12 +304,15 @@ impl RequestHandler for MyDnsHandler {
                 .optional()
                 .expect("DB query failed");
             if let Some((_token, registered_sub)) = result {
-                println!("DNS [{}] {} -> {} 来源 {} 回复 {}", rt, normalized_query, registered_sub, client_ip, resp_ip);
-                let _ = conn.execute(
-                    "INSERT INTO logs (registered_subdomain, requested_domain, client_ip, timestamp, record_type) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![registered_sub, normalized_query, client_ip, timestamp, rt],
-                );
-                let _ = ip_tx.try_send(ip_for_lookup);
+                // Only log A and ANY queries to avoid flooding from resolver AAAA/CNAME/etc. retries
+                if query_type == RecordType::A || query_type == RecordType::ANY {
+                    println!("DNS [{}] {} -> {} 来源 {} 回复 {}", rt, normalized_query, registered_sub, client_ip, resp_ip);
+                    let _ = conn.execute(
+                        "INSERT INTO logs (registered_subdomain, requested_domain, client_ip, timestamp, record_type) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![registered_sub, normalized_query, client_ip, timestamp, rt],
+                    );
+                    let _ = ip_tx.try_send(ip_for_lookup);
+                }
                 true
             } else {
                 println!("DNS [{}] {} (未注册) 来源 {}", rt, normalized_query, client_ip);
@@ -316,24 +320,37 @@ impl RequestHandler for MyDnsHandler {
             }
         }).await.expect("spawn_blocking failed");
 
-        let info = if matched && (query.query_type() == RecordType::A || query.query_type() == RecordType::ANY) {
-            // Return a fake A record with configured IP
-            let mut header = Header::new();
-            header.set_response_code(ResponseCode::NoError);
-            header.set_authoritative(true);
-            header.set_recursion_available(true);
-            let name = query.name().clone().into();
-            let mut record = Record::new();
-            record.set_name(name);
-            record.set_record_type(RecordType::A);
-            record.set_ttl(0);
-            record.set_data(Some(RData::A(resp_ip)));
-            let answers = vec![record];
-            let response = MessageResponseBuilder::from_message_request(request)
-                .build(header, answers.iter(), vec![], vec![], vec![]);
-            response_handle.send_response(response).await.expect("failed to send response")
+        let info = if matched {
+            if query.query_type() == RecordType::A || query.query_type() == RecordType::ANY {
+                // Return a fake A record with configured IP
+                let mut header = Header::response_from_request(request.header());
+                header.set_response_code(ResponseCode::NoError);
+                header.set_authoritative(true);
+                header.set_recursion_available(true);
+                let name = query.name().clone().into();
+                let mut record = Record::new();
+                record.set_name(name);
+                record.set_record_type(RecordType::A);
+                record.set_ttl(60);
+                record.set_data(Some(RData::A(resp_ip)));
+                let answers = vec![record];
+                let response = MessageResponseBuilder::from_message_request(request)
+                    .build(header, answers.iter(), vec![], vec![], vec![]);
+                response_handle.send_response(response).await.expect("failed to send response")
+            } else {
+                // Domain exists but no record for this type - return NOERROR with empty answer
+                // This prevents resolver retries (NXDOMAIN would trigger re-queries)
+                let mut header = Header::response_from_request(request.header());
+                header.set_response_code(ResponseCode::NoError);
+                header.set_authoritative(true);
+                header.set_recursion_available(true);
+                let empty: Vec<Record> = vec![];
+                let response = MessageResponseBuilder::from_message_request(request)
+                    .build(header, empty.iter(), vec![], vec![], vec![]);
+                response_handle.send_response(response).await.expect("failed to send response")
+            }
         } else {
-            // NXDOMAIN for unmatched or non-A queries
+            // Unmatched domain - NXDOMAIN
             let response = MessageResponseBuilder::from_message_request(request)
                 .error_msg(request.header(), ResponseCode::NXDomain);
             response_handle.send_response(response).await.expect("failed to send response")
@@ -737,7 +754,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans',
         </div></div>
     </div>
 </main>
-<div class="footer">&copy; 2024 AdySec &mdash; DNSLog 平台 &mdash; 基于 Rust + Actix 构建</div>
+<div class="footer">&copy; 2026 Pepster &mdash; DNSLog 平台 &mdash; 基于 Rust + Actix 构建</div>
 <div id="toastContainer" class="toast-container"></div>
 <script>
 var TOKEN = '{token}';
